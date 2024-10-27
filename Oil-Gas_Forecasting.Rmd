@@ -1,0 +1,510 @@
+---
+title: "Oil & Gas: Time-Series Forecasting"
+author: "Emad Abdellatif"
+date: "October 27th, 2024"
+output:
+  html_document:
+    df_print: default
+    highlight: tango
+    theme: readable
+    toc: yes
+  pdf_document:
+    toc: yes
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+       message = FALSE,
+       warning = FALSE)
+```
+
+# (1) Data Cleaning & Exploration
+
+
+```{r}
+library(tidyverse)
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(forecast)
+library(tseries)
+library(modeltime)
+library(tidymodels)
+library(prophet)
+library(timetk)
+
+
+setwd("~/Desktop/Data Science Projects/Oil & Gas Forecasting")
+
+data <- read.csv("well_data.csv")
+```
+
+## "series" dataframe
+
+```{r}
+series <- data %>%
+  select(period, well_name) |>
+  mutate(value = 1) %>% 
+  pivot_wider(names_from = well_name, values_from = value, values_fill = list(value = 0)) %>%
+  arrange(period)
+
+series |>
+  slice_head(n=20)
+
+```
+<br>
+
+## Well Characteristics Data Frame
+
+```{r}
+well_characteristics <- data %>%
+  rename(date = period) |>
+  group_by(well_name) %>%
+  summarise(
+    Avg_Gas_to_Oil_Ratio = mean(gas_total / oil, na.rm = TRUE),
+    Months_of_Production = n(),
+    Initial_Production_Date = min(date),
+    Avg_Monthly_Gas_Decline_Rate = {
+      gas_diff <- diff(gas_total)
+      gas_lag <- lag(gas_total, default = first(gas_total))[-1]  
+      rate <- gas_diff / gas_lag
+      rate[is.infinite(rate)] <- NA 
+      mean(rate, na.rm = TRUE)
+    }
+  ) %>%
+  ungroup()
+
+print(well_characteristics)
+
+```
+
+<br>
+
+
+# (2) Forecasting
+
+## Filtering out Wells < 24 months and data with zero production
+
+```{r}
+wells_ge_24 <- well_characteristics |>
+  filter(Months_of_Production >= 24)
+
+cleaned_data <- data |>
+  filter(well_name %in% wells_ge_24$well_name & oil != 0 & gas_total != 0) |>
+  rename(date = period)
+```
+
+<br>
+
+## Data Cleaning & Exploration
+
+
+Combine data for all Wells into a single aggregated dataframe
+```{r}
+data_aggregated <- cleaned_data %>%
+  mutate(date = as.Date(date, format = "%Y-%m-%d")) |>
+  group_by(date) %>%
+  summarise(total_oil = sum(oil, na.rm = TRUE),
+            total_gas = sum(gas_total, na.rm = TRUE)) |>
+  arrange(date)
+
+head(data_aggregated)
+
+```
+<br>
+
+Plot the full time series to observe the behavior of the data.
+```{r}
+ggplot(data_aggregated, aes(x = date, y = total_oil)) +
+  geom_line(color = "blue") + 
+  labs(title = "Oil Production Over Time",
+       x = "Month",
+       y = "barrels/d") +
+  theme_minimal()
+
+
+```
+<br>
+
+The data appears to display high volatility between 1980 and 2010 with the trend showing stabilization after 2010. Due to this, I made the decision to remove the data prior to 2010 and focus on 2010-2018 data for forecasting. Given that the goal is to forecast the next 6 months, the last 8 years of data seems to be more applicable.
+
+### 2010 - present Data
+```{r}
+data_subset <- data_aggregated |>
+  filter(date >= as.Date("2010-01-01"))
+
+
+data_subset_oil <- data_subset |>
+  select(date, total_oil)
+
+data_subset_oil |> plot_time_series(date, total_oil)
+
+```
+
+<br>
+
+Looking at the plot above, we can see that there may be an outlier between 2015 and 2016. I'll go ahead and include a step for handling outliers.
+
+
+### Handling Outliers
+```{r}
+Q1 <- quantile(data_subset_oil$total_oil, 0.25)
+Q3 <- quantile(data_subset_oil$total_oil, 0.75)
+IQR <- Q3 - Q1
+
+lower_bound <- Q1 - 1.5 * IQR
+upper_bound <- Q3 + 1.5 * IQR
+
+outliers <- which(data_subset_oil$total_oil < lower_bound | data_subset_oil$total_oil > upper_bound)
+
+median_value <- median(data_subset_oil$total_oil, na.rm = TRUE)
+data_subset_oil$total_oil[outliers] <- median_value
+
+```
+<br>
+
+Let's take a look at the data after handling outliers
+
+```{r}
+data_subset_oil |> plot_time_series(date, total_oil)
+
+```
+
+<br>
+
+
+### Test for Stationarity
+
+I'll use the ADF test to test for stationarity
+
+```{r}
+strtyr <- min(year(data_subset_oil$date))
+
+ts_data <- ts(data_subset_oil$total_oil,
+              frequency = 12,
+              start = c(strtyr, 1))
+
+adf_oil <- adf.test(ts_data, alternative = "stationary")
+print(adf_oil)
+
+```
+<br>
+
+With a p-value of 0.6743, the results show no-stationarity. I'll try first differencing.
+
+### Differencing
+
+```{r}
+
+diff_ts_data <- diff(ts_data) 
+adf_test_diff <- adf.test(diff_ts_data, alternative = "stationary")
+print(adf_test_diff)
+
+```
+
+P-value is now below 0.05, showing stationarity after differencing.
+
+
+<br>
+
+I'll now go ahead and split the data into training and test sets and observe the performance of the models *auto_arima*, *prophet*, *prophet_xgboost*, *glmnet*, and *auto_arima_boost*.
+
+## Model Testing
+
+### Train/Test splits
+```{r}
+
+splits <- time_series_split(
+  data_subset_oil,
+  assess     = "12 months",
+  cumulative = TRUE
+)
+
+splits %>%
+  tk_time_series_cv_plan() %>%
+  plot_time_series_cv_plan(date, total_oil)
+```
+
+<br>
+
+### Model Fitting
+
+```{r}
+# FORECAST ----
+
+# * AUTO ARIMA ----
+model_arima <- arima_reg() %>%
+  set_engine("auto_arima") %>%
+  fit(total_oil ~ date, training(splits))
+
+# * Prophet ----
+model_prophet <- prophet_reg(
+  seasonality_yearly = FALSE,
+) %>%
+  set_engine("prophet") %>%
+  fit(total_oil ~ date, training(splits))
+
+# * Prophet XGBoost----
+model_prophet_xg <- prophet_boost(
+  seasonality_yearly = FALSE
+) %>%
+  set_engine("prophet_xgboost") %>%
+  fit(total_oil ~ date + as.numeric(date) + month(date, label = TRUE),
+      training(splits))
+
+# * Machine Learning - GLM ----
+library(glmnet)
+model_glmnet <- linear_reg(penalty = 0.1
+                           ,mixture = 0.5) %>%
+  set_engine("glmnet") %>%
+  fit(
+    total_oil ~ month(date, label = TRUE)
+    + as.numeric(date),
+    training(splits)
+  )
+
+# Auto ARIMA with XGBoost
+model_arima_boost <- arima_boost() |>
+  set_engine("auto_arima_xgboost") |>
+  fit(total_oil ~ date + as.numeric(date) + month(date, label = TRUE),
+      training(splits))
+```
+
+<br>
+
+### Model Comparison
+
+```{r}
+model_tbl <- modeltime_table(
+  model_arima,
+  model_prophet,
+  model_prophet_xg,
+  model_glmnet,
+  model_arima_boost
+)
+
+```
+<br>
+
+Calculate the accuracy of the models on the training set and the test set.
+```{r}
+calib_tbl_train <- model_tbl %>%
+  modeltime_calibrate(training(splits))
+
+calib_tbl <- model_tbl %>%
+  modeltime_calibrate(testing(splits))
+
+calib_tbl_train %>% modeltime_accuracy()
+calib_tbl %>% modeltime_accuracy()
+```
+
+Based on the summaries of the models between both the training set and the test set, the model **ARIMA (0,1,1) with XGBoost** seems to be performing the best out of the 4 other models after reviewing the **rmse** and **mae** values between both the training set and the test set. 
+<br>
+
+
+### Plot Residuals
+
+Plot the residuals of the training set
+```{r}
+residuals_timeplot_train <- model_tbl |>
+  modeltime_calibrate(training(splits)) |>
+  modeltime_residuals() |>
+  plot_modeltime_residuals(
+    .type = "timeplot",
+    .interactive = TRUE
+  )
+
+residuals_timeplot_train
+```
+
+Looking at the residuals, the models **Prophet with XGBoost**, and **ARIMA(0,1,1) with XGBoost** seem to be capturing the overall trend and variability in the data reasonably well.
+
+<br>
+
+
+### Plot ACF
+
+Plot the ACF of the residuals for the training set
+```{r}
+residuals_acf_train <- model_tbl |>
+  modeltime_calibrate(training(splits)) |>
+  modeltime_residuals() |>
+  plot_modeltime_residuals(
+    .type = "acf",
+    .interactive = TRUE
+  )
+
+residuals_acf_train
+
+```
+
+**ARIMA(0,1,1)**, **Prophet with XBoost**, and **ARIMA(0,1,1) with XGBoost** show no significant auto-correlation, although **ARIMA (0,1,1) with XGBoost** crosses the bounds of the confidence interval slighlty more than **ARIMA (0,1,1)** and **Prophet with XGBoost**.
+<br>
+
+### Forecast on Original data
+
+Display the forecast for the next 6 months using the 5 models that were tested, for comparison.
+```{r}
+future_forecast_tbl <- calib_tbl %>%
+  modeltime_refit(data_subset_oil) %>%
+  modeltime_forecast(
+    h           = "6 months",
+    actual_data = data_subset_oil
+  ) %>%
+  plot_modeltime_forecast()
+
+future_forecast_tbl
+```
+<br>
+
+
+In summary, I started my exploratory analysis by evaluating the long term trend of the oil production data and the benefit of having the full data during forecasting. I concluded that the data from 2010 and onwards seemed more suitable and applicable for forecasting the next 6 months.
+
+Outliers were observed during the period between 2015 and 2016 that could've affected the modeling results moving forward. I went ahead and addressed the outliers using the IQR method for outlier detection.
+
+In the forecasting phase, I utilized the following models **ARIMA**, **ARIMA with XGBoost**, **Prophet**, **Prophet with XGBoost**, and **Elastic Net (GLMNET)**. Based on the results of the models and the distribution of the residuals, it appears that **ARIMA with XGBoost** performs the best based on the *rmse* and *mae* along with the residual plots of both the training and the test sets.
+
+
+
+# (3) Visualization
+
+<p>
+  <a class="btn btn-info btn-sm" data-toggle="collapse" data-target="#collapseToggle" role="button" aria-expanded="false" aria-controls="collapseExample">
+    Show/Hide code
+  </a>
+</p>
+
+<div class="collapse" id="collapseToggle">
+  <div class="card card-body">
+```{r}
+insert_well_forecast <- function(well) {
+  
+  df <- cleaned_data |> 
+    filter(well_name == well) |>
+    mutate(Months_of_Production = row_number()) |>
+    rename(total_oil = oil) |>
+    mutate(date = as.Date(date, format = "%Y-%m-%d"))
+
+  ### Handling Outliers
+  Q1 <- quantile(df$total_oil, 0.25)
+  Q3 <- quantile(df$total_oil, 0.75)
+  IQR <- Q3 - Q1
+
+  lower_bound <- Q1 - 1.5 * IQR
+  upper_bound <- Q3 + 1.5 * IQR
+
+  outliers <- which(df$total_oil < lower_bound | df$total_oil > upper_bound)
+
+  median_value <- median(df$total_oil, na.rm = TRUE)
+  df$total_oil[outliers] <- median_value
+  
+  split_index <- round(max(df$Months_of_Production) * 0.2)
+  
+  df <- df |>
+    select(date, total_oil, well_name)
+  
+  
+  splits <- time_series_split(
+    df,
+    assess     = split_index,
+    cumulative = TRUE
+  )
+  
+  # FORECAST ----
+  # * Prophet ----
+  model_prophet <- prophet_reg(
+    seasonality_yearly = FALSE
+  ) %>%
+    set_engine("prophet") %>%
+    fit(total_oil ~ date, training(splits))
+  
+  # * Prophet XGBoost----
+  model_prophet_xg <- prophet_boost(
+    seasonality_yearly = FALSE
+  ) %>%
+    set_engine("prophet_xgboost") %>%
+    fit(total_oil ~ date + as.numeric(date) + month(date, label = TRUE),
+        training(splits))
+  
+  # * AUTO ARIMA ----
+  model_arima <- arima_reg() %>%
+    set_engine("auto_arima") %>%
+    fit(total_oil ~ date, training(splits))
+  
+  # STLM ETS
+  model_arima_boost <- arima_boost() |>
+    set_engine("auto_arima_xgboost") |>
+    fit(total_oil ~ date + as.numeric(date) + month(date, label = TRUE),
+        training(splits))
+  
+  model_arima_boost
+  
+  
+  # MODELTIME COMPARE ----
+  
+  # * Modeltime Table ----
+  model_tbl <- modeltime_table(
+    model_arima_boost
+  )
+  
+  
+  # * Calibrate ----
+  calib_tbl <- model_tbl %>%
+    modeltime_calibrate(testing(splits))
+  
+  # * Accuracy ----
+  model_accuracy <- calib_tbl %>% modeltime_accuracy()
+  model_accuracy
+  
+  future_forecast_tbl <- calib_tbl %>%
+    modeltime_refit(df) %>%
+    modeltime_forecast(
+      h           = "6 months",
+      actual_data = df
+    )
+  
+  plot_data <- future_forecast_tbl |>
+    select(.model_desc, .key, .index, .value, .conf_lo, .conf_hi) |>
+    rename(model = .model_desc,
+           key = .key,
+           date = .index,
+           value = .value,
+           conf_lo = .conf_lo,
+           conf_hi = .conf_hi) |>
+    mutate(Months_of_Production = row_number())
+  
+  
+  display_forecast <- ggplot(plot_data, aes(x = Months_of_Production, y = value, color = key)) +
+                        geom_line() +
+                        geom_ribbon(aes(ymin = conf_lo, ymax = conf_hi), fill = "blue", alpha = 0.2) +
+                        labs(title = paste0("Projected Oil Production Growth (",well,") from",
+                                            year(min(plot_data$date)),"-", year(max(plot_data$date))), x = "Date", y = "Value") +
+                        scale_x_continuous(breaks = seq(1, max(plot_data$Months_of_Production), by = 12)) +
+                        theme_minimal()+
+                        theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    labs(y = "Barrels/d",
+         x = "Months")
+  
+  display_forecast
+  
+  
+  return(display_forecast)
+  
+}
+
+```
+  </div>
+</div>
+
+
+```{r}
+forecasted_viz_11A <- insert_well_forecast("FIELD11A")
+forecasted_viz_58 <- insert_well_forecast("FIELD58")
+
+
+forecasted_viz_11A
+forecasted_viz_58
+
+```
+
+
